@@ -3,5 +3,8 @@
   "version": "1.0.0",
   "main": "lightning-proxy.js",
   "scripts": { "start": "node lightning-proxy.js" },
-  "dependencies": { "ws": "^8.18.0" }
+  "dependencies": {
+    "ws": "^8.18.0",
+    "mqtt": "^5.10.0"
+  }
 }
