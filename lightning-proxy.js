@@ -22,14 +22,13 @@ const BLITZORTUNG_URLS = [
   'wss://ws1.blitzortung.org/',
   'wss://ws7.blitzortung.org/',
   'wss://ws8.blitzortung.org/',
-  'wss://ws3.blitzortung.org/',
 ];
-// Bounding box sent to Blitzortung — widest region (Europe) so we
-// receive everything and filter per-client based on their region setting
+
 const SUBSCRIBE = JSON.stringify({
   west: -30, east: 50, north: 72, south: 28,
 });
 const RECONNECT_MS = 5000;
+const PING_MS      = 15000;  // keepalive ping every 15s
 
 // ── State ──────────────────────────────────────────────────────────────────
 let blitzWs     = null;
@@ -61,23 +60,38 @@ wss.on('connection', function(ws, req) {
 console.log('[proxy] Browser WebSocket server listening on port', PROXY_PORT);
 
 // ── Blitzortung upstream connection ───────────────────────────────────────
+let pingTimer = null;
+
 function connectBlitzortung() {
   if (reconnTimer) { clearTimeout(reconnTimer); reconnTimer = null; }
+  if (pingTimer)   { clearInterval(pingTimer);  pingTimer   = null; }
 
   const url = BLITZORTUNG_URLS[wsIndex % BLITZORTUNG_URLS.length];
   console.log('[proxy] Connecting to Blitzortung:', url);
 
   blitzWs = new WebSocket(url, {
     headers: {
-      'Origin':     'https://www.blitzortung.org',
-      'User-Agent': 'Mozilla/5.0',
-    }
+      'Origin':          'https://www.blitzortung.org',
+      'User-Agent':      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control':   'no-cache',
+      'Pragma':          'no-cache',
+    },
+    rejectUnauthorized: false,
   });
 
   blitzWs.on('open', function() {
-    console.log('[proxy] Blitzortung connected');
+    console.log('[proxy] Blitzortung connected — subscribing');
     blitzWs.send(SUBSCRIBE);
+    // Keepalive ping every 15s — Blitzortung drops idle connections
+    pingTimer = setInterval(function() {
+      if (blitzWs && blitzWs.readyState === WebSocket.OPEN) {
+        try { blitzWs.ping(); } catch(_) {}
+      }
+    }, 15000);
   });
+
+  blitzWs.on('pong', function() { /* alive */ });
 
   blitzWs.on('message', function(raw) {
     try {
@@ -119,14 +133,16 @@ function connectBlitzortung() {
     } catch(e) {}
   });
 
-  blitzWs.on('close', function() {
-    console.log('[proxy] Blitzortung disconnected — reconnecting in', RECONNECT_MS, 'ms');
+  blitzWs.on('close', function(code) {
+    console.log('[proxy] Blitzortung disconnected code=' + code + ' — reconnecting');
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     wsIndex++;
     reconnTimer = setTimeout(connectBlitzortung, RECONNECT_MS);
   });
 
   blitzWs.on('error', function(e) {
     console.warn('[proxy] Blitzortung error:', e.message);
+    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     wsIndex++;
     try { blitzWs.close(); } catch(_) {}
   });
