@@ -1,166 +1,76 @@
 /**
- * lightning-proxy.js — Blitzortung WebSocket Proxy
+ * lightning-proxy.js — Blitzortung MQTT → WebSocket Proxy
  * ─────────────────────────────────────────────────────────────────────────────
- * Runs on your VPS. Connects to Blitzortung on behalf of your server,
- * then relays strikes to all connected browser clients.
+ * Connects to the public Blitzortung MQTT server (blitzortung.ha.sed.pl:1883)
+ * which is specifically designed for third-party app integration.
+ * Relays strikes to browser clients over WebSocket.
  *
- * Install:  npm install ws
+ * Install:  npm install mqtt ws
  * Run:      node lightning-proxy.js
- * Or with pm2 (recommended): pm2 start lightning-proxy.js --name lightning
- *
- * The browser connects to: wss://yourdomain.com/lightning-ws
- * (configure your nginx to proxy that path to port 2345)
+ * PM2:      pm2 start lightning-proxy.js --name lightning
  */
 
 'use strict';
 
+const mqtt = require('mqtt');
 const { WebSocketServer, WebSocket } = require('ws');
 
 // ── Config ─────────────────────────────────────────────────────────────────
-const PROXY_PORT      = 2345;          // port this proxy listens on
-const BLITZORTUNG_URLS = [
-  'wss://ws1.blitzortung.org/',
-  'wss://ws7.blitzortung.org/',
-  'wss://ws8.blitzortung.org/',
-];
-
-const SUBSCRIBE = JSON.stringify({
-  west: -30, east: 50, north: 72, south: 28,
-});
-const RECONNECT_MS = 5000;
-const PING_MS      = 15000;  // keepalive ping every 15s
+const PROXY_PORT = process.env.PORT || 2345;
+const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
+const MQTT_TOPIC = 'blitzortung/1.1/#';
 
 // ── State ──────────────────────────────────────────────────────────────────
-let blitzWs     = null;
-let wsIndex     = 0;
-let clients     = new Set();   // connected browser clients
+let clients     = new Set();
 let strikeCount = 0;
-let reconnTimer = null;
 
 // ── Browser WebSocket server ───────────────────────────────────────────────
 const wss = new WebSocketServer({ port: PROXY_PORT });
 
-wss.on('connection', function(ws, req) {
+wss.on('connection', function(ws) {
   clients.add(ws);
-  console.log('[proxy] Client connected — total:', clients.size);
-
-  ws.on('close', function() {
-    clients.delete(ws);
-    console.log('[proxy] Client disconnected — total:', clients.size);
-  });
-
-  ws.on('error', function(e) {
-    clients.delete(ws);
-  });
-
-  // Send current stats immediately
-  ws.send(JSON.stringify({ type: 'stats', count: strikeCount, clients: clients.size }));
+  console.log('[proxy] Browser client connected — total:', clients.size);
+  ws.on('close',  function()  { clients.delete(ws); console.log('[proxy] Client gone — total:', clients.size); });
+  ws.on('error',  function()  { clients.delete(ws); });
+  ws.send(JSON.stringify({ type: 'stats', strikeCount, clients: clients.size }));
 });
 
-console.log('[proxy] Browser WebSocket server listening on port', PROXY_PORT);
+console.log('[proxy] WebSocket server listening on port', PROXY_PORT);
 
-// ── Blitzortung upstream connection ───────────────────────────────────────
-let pingTimer = null;
+// ── MQTT connection ────────────────────────────────────────────────────────
+const mqttClient = mqtt.connect(MQTT_HOST, {
+  clientId:        'sss_proxy_' + Math.random().toString(16).slice(2, 8),
+  clean:           true,
+  reconnectPeriod: 5000,
+  connectTimeout:  10000,
+});
 
-function connectBlitzortung() {
-  if (reconnTimer) { clearTimeout(reconnTimer); reconnTimer = null; }
-  if (pingTimer)   { clearInterval(pingTimer);  pingTimer   = null; }
-
-  const url = BLITZORTUNG_URLS[wsIndex % BLITZORTUNG_URLS.length];
-  console.log('[proxy] Connecting to Blitzortung:', url);
-
-  blitzWs = new WebSocket(url, {
-    headers: {
-      'Origin':          'https://www.blitzortung.org',
-      'User-Agent':      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cache-Control':   'no-cache',
-      'Pragma':          'no-cache',
-    },
-    rejectUnauthorized: false,
+mqttClient.on('connect', function() {
+  console.log('[proxy] MQTT connected to', MQTT_HOST);
+  mqttClient.subscribe(MQTT_TOPIC, function(err) {
+    if (err) console.error('[proxy] Subscribe error:', err.message);
+    else     console.log('[proxy] Subscribed to', MQTT_TOPIC);
   });
+});
 
-  blitzWs.on('open', function() {
-    console.log('[proxy] Blitzortung connected — subscribing');
-    blitzWs.send(SUBSCRIBE);
-    // Keepalive ping every 15s — Blitzortung drops idle connections
-    pingTimer = setInterval(function() {
-      if (blitzWs && blitzWs.readyState === WebSocket.OPEN) {
-        try { blitzWs.ping(); } catch(_) {}
-      }
-    }, 15000);
-  });
+mqttClient.on('message', function(topic, payload) {
+  try {
+    var data = JSON.parse(payload.toString());
+    var lat  = parseFloat(data.lat);
+    var lon  = parseFloat(data.lon);
+    if (isNaN(lat) || isNaN(lon)) return;
 
-  blitzWs.on('pong', function() { /* alive */ });
+    strikeCount++;
+    if (strikeCount % 100 === 0)
+      console.log('[proxy] Relayed', strikeCount, 'strikes | clients:', clients.size);
 
-  blitzWs.on('message', function(raw) {
-    try {
-      var data = JSON.parse(raw.toString());
-      var lat, lng, pairs = [];
+    var msg = JSON.stringify({ type: 'strikes', time: Date.now(), strikes: [{ lat, lng: lon }] });
+    clients.forEach(function(client) {
+      if (client.readyState === WebSocket.OPEN) client.send(msg);
+    });
+  } catch(e) {}
+});
 
-      // Parse all known Blitzortung message formats
-      if (data.lat !== undefined) {
-        lat = parseFloat(data.lat);
-        lng = parseFloat(data.lon ?? data.lng);
-        if (!isNaN(lat) && !isNaN(lng)) pairs.push({ lat, lng });
-      } else if (Array.isArray(data) && data.length >= 2) {
-        lat = parseFloat(data[0]); lng = parseFloat(data[1]);
-        if (!isNaN(lat) && !isNaN(lng)) pairs.push({ lat, lng });
-      } else if (data.strikes && Array.isArray(data.strikes)) {
-        data.strikes.forEach(function(s) {
-          var la = parseFloat(s.lat ?? s[0]);
-          var lo = parseFloat(s.lon ?? s.lng ?? s[1]);
-          if (!isNaN(la) && !isNaN(lo)) pairs.push({ lat: la, lng: lo });
-        });
-      }
-
-      if (!pairs.length) return;
-
-      // Relay to all connected clients
-      var now = Date.now();
-      var msg = JSON.stringify({ type: 'strikes', time: now, strikes: pairs });
-      strikeCount += pairs.length;
-
-      clients.forEach(function(client) {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(msg);
-        }
-      });
-
-      if (strikeCount % 100 === 0) {
-        console.log('[proxy] Relayed', strikeCount, 'strikes total, clients:', clients.size);
-      }
-    } catch(e) {}
-  });
-
-  blitzWs.on('close', function(code) {
-    console.log('[proxy] Blitzortung disconnected code=' + code + ' — reconnecting');
-    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-    wsIndex++;
-    reconnTimer = setTimeout(connectBlitzortung, RECONNECT_MS);
-  });
-
-  blitzWs.on('error', function(e) {
-    console.warn('[proxy] Blitzortung error:', e.message);
-    if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
-    wsIndex++;
-    try { blitzWs.close(); } catch(_) {}
-  });
-}
-
-connectBlitzortung();
-
-// ── Nginx config (add this to your server block) ───────────────────────────
-/*
-
-location /lightning-ws {
-    proxy_pass         http://127.0.0.1:2345;
-    proxy_http_version 1.1;
-    proxy_set_header   Upgrade    $http_upgrade;
-    proxy_set_header   Connection "upgrade";
-    proxy_set_header   Host       $host;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-}
-
-*/
+mqttClient.on('reconnect', function() { console.log('[proxy] MQTT reconnecting…'); });
+mqttClient.on('error',     function(e) { console.error('[proxy] MQTT error:', e.message); });
+mqttClient.on('offline',   function()  { console.log('[proxy] MQTT offline'); });
