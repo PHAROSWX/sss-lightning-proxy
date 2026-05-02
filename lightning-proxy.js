@@ -25,7 +25,7 @@ let clients     = new Set();
 let strikeCount = 0;
 
 // ── Browser WebSocket server ───────────────────────────────────────────────
-const wss = new WebSocketServer({ port: PROXY_PORT });
+// WebSocket server attached to HTTP server below
 
 wss.on('connection', function(ws) {
   clients.add(ws);
@@ -36,6 +36,20 @@ wss.on('connection', function(ws) {
 });
 
 console.log('[proxy] WebSocket server listening on port', PROXY_PORT);
+
+// Railway requires an HTTP response on the same port for health checks
+// The WebSocketServer handles upgrade requests; HTTP requests get a simple 200
+const http = require('http');
+const httpServer = http.createServer(function(req, res) {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('SSS Lightning Proxy — ' + strikeCount + ' strikes relayed\n');
+});
+// Attach WebSocket server to the http server so both share the same port
+const wss2 = new WebSocketServer({ server: httpServer });
+wss2.on('connection', wss.emit.bind(wss, 'connection'));
+httpServer.listen(PROXY_PORT, '0.0.0.0', function() {
+  console.log('[proxy] HTTP+WS server on port', PROXY_PORT);
+});
 
 // ── MQTT connection ────────────────────────────────────────────────────────
 const mqttClient = mqtt.connect(MQTT_HOST, {
