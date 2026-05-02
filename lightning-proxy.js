@@ -1,57 +1,44 @@
 /**
  * lightning-proxy.js — Blitzortung MQTT → WebSocket Proxy
- * ─────────────────────────────────────────────────────────────────────────────
- * Connects to the public Blitzortung MQTT server (blitzortung.ha.sed.pl:1883)
- * which is specifically designed for third-party app integration.
- * Relays strikes to browser clients over WebSocket.
- *
  * Install:  npm install mqtt ws
  * Run:      node lightning-proxy.js
- * PM2:      pm2 start lightning-proxy.js --name lightning
  */
 
 'use strict';
 
-const mqtt = require('mqtt');
+const http  = require('http');
+const mqtt  = require('mqtt');
 const { WebSocketServer, WebSocket } = require('ws');
 
-// ── Config ─────────────────────────────────────────────────────────────────
-const PROXY_PORT = process.env.PORT || 2345;
+const PROXY_PORT = process.env.PORT || 8080;
 const MQTT_HOST  = 'mqtt://blitzortung.ha.sed.pl:1883';
 const MQTT_TOPIC = 'blitzortung/1.1/#';
 
-// ── State ──────────────────────────────────────────────────────────────────
 let clients     = new Set();
 let strikeCount = 0;
 
-// ── Browser WebSocket server ───────────────────────────────────────────────
-// WebSocket server attached to HTTP server below
-
-wss.on('connection', function(ws) {
-  clients.add(ws);
-  console.log('[proxy] Browser client connected — total:', clients.size);
-  ws.on('close',  function()  { clients.delete(ws); console.log('[proxy] Client gone — total:', clients.size); });
-  ws.on('error',  function()  { clients.delete(ws); });
-  ws.send(JSON.stringify({ type: 'stats', strikeCount, clients: clients.size }));
-});
-
-console.log('[proxy] WebSocket server listening on port', PROXY_PORT);
-
-// Railway requires an HTTP response on the same port for health checks
-// The WebSocketServer handles upgrade requests; HTTP requests get a simple 200
-const http = require('http');
-const httpServer = http.createServer(function(req, res) {
+// HTTP server (Railway health check + WebSocket upgrade)
+const server = http.createServer(function(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('SSS Lightning Proxy — ' + strikeCount + ' strikes relayed\n');
 });
-// Attach WebSocket server to the http server so both share the same port
-const wss2 = new WebSocketServer({ server: httpServer });
-wss2.on('connection', wss.emit.bind(wss, 'connection'));
-httpServer.listen(PROXY_PORT, '0.0.0.0', function() {
-  console.log('[proxy] HTTP+WS server on port', PROXY_PORT);
+
+// WebSocket server attached to HTTP server
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', function(ws) {
+  clients.add(ws);
+  console.log('[proxy] Client connected — total:', clients.size);
+  ws.on('close',  function() { clients.delete(ws); console.log('[proxy] Client gone — total:', clients.size); });
+  ws.on('error',  function() { clients.delete(ws); });
+  ws.send(JSON.stringify({ type: 'stats', strikeCount, clients: clients.size }));
 });
 
-// ── MQTT connection ────────────────────────────────────────────────────────
+server.listen(PROXY_PORT, '0.0.0.0', function() {
+  console.log('[proxy] HTTP+WS listening on port', PROXY_PORT);
+});
+
+// MQTT connection to public Blitzortung server
 const mqttClient = mqtt.connect(MQTT_HOST, {
   clientId:        'sss_proxy_' + Math.random().toString(16).slice(2, 8),
   clean:           true,
